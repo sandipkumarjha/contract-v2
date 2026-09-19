@@ -64,6 +64,10 @@ jobs:
         with:
           version: stable
 
+      - name: Install Foundry dependencies
+        working-directory: packages/contracts
+        run: forge install --no-git foundry-rs/forge-std@7fdf81f9ceb2f6ebbb8f9f1c6c5274d5bcc9a1f5 OpenZeppelin/openzeppelin-contracts@69c8def5f222ff96f2b5beff05dfba996368aa79
+
       - name: Forge build
         working-directory: packages/contracts
         run: forge build --sizes
