@@ -1,0 +1,400 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {OracleAdapter} from "./OracleAdapter.sol";
+import {EmergencyRegistry} from "./EmergencyRegistry.sol";
+import {IWETH} from "./interfaces/IWETH.sol";
+
+/// @title PairVault — two-token vault funded in kind
+/// @notice Depositors add both tokens directly; no swaps or DEX liquidity are
+///         needed. The first deposit (made by the factory at launch) must match
+///         the target weight at oracle prices and mints 1e18 shares per $1.
+///         Later deposits are proportional to current reserves, so share math
+///         never depends on the oracle and redemptions can never be blocked by a
+///         stale price. Deposits: creator or fee-exempt recipients only — the pair
+///         is private to its creator and the public holds the pair's curve token,
+///         whose buys reach the vault through the factory-approved CurveRouter.
+///         Redeem is open to any share holder. The creator fee (shares minted to
+///         the creator) only applies to depositors outside those paths, so in
+///         practice it is never charged. Deposits pause while either stock token
+///         has a pending ERC-8056 multiplier change.
+///
+///         The vault is its own ERC-20 share token (like ERC-4626): shares are
+///         minted only inside `deposit` against the tokens pulled in and burned
+///         only from the caller (or from an owner who granted a standard ERC-20
+///         allowance) inside `redeem`. No address can mint or burn otherwise.
+contract PairVault is ERC20, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    /// @dev Max deviation of the seed's value split from `weightABps`.
+    uint16 public constant WEIGHT_TOLERANCE_BPS = 300;
+    /// @dev Seed must be worth at least $1 (1e18 shares).
+    uint256 public constant MIN_INITIAL_SHARES = 1e18;
+    /// @dev USD with 8 decimals -> 18-decimal shares.
+    uint256 private constant SHARE_SCALE = 1e10;
+
+    struct Config {
+        address creator;
+        address tokenA;
+        address tokenB;
+        uint16 weightABps;
+        uint16 creatorFeeBps;
+        address oracle;
+        address emergency;
+        address weth;
+        /// @dev Launching factory (its seed is fee-free); defaults to the deployer.
+        address factory;
+    }
+
+    /// @dev Every vault is an EIP-1167 clone of one verified implementation (see
+    ///      PairDeployer), so its configuration lives in storage and is set once by
+    ///      `initialize` instead of a constructor. The explorer resolves the clone to
+    ///      the implementation, so each launched vault shows up verified instantly.
+    bool private _initialized;
+    string private _shareName;
+    string private _shareSymbol;
+    address public factory;
+    address public creator;
+    address public tokenA;
+    address public tokenB;
+    address public weth;
+    uint16 public weightABps;
+    uint16 public creatorFeeBps;
+    uint8 public decimalsA;
+    uint8 public decimalsB;
+    OracleAdapter public oracle;
+    EmergencyRegistry public emergency;
+
+    /// @notice Total shares ever minted to the creator as deposit fees.
+    uint256 public creatorFeeShares;
+
+    event Deposited(
+        address indexed user,
+        uint256 amountA,
+        uint256 amountB,
+        uint256 sharesMinted,
+        uint256 feeShares,
+        uint256 navUsd8
+    );
+    event Redeemed(
+        address indexed user,
+        uint256 sharesBurned,
+        uint256 amountA,
+        uint256 amountB,
+        uint256 valueUsd8
+    );
+
+    /// @dev The implementation itself is locked: only clones can be initialized.
+    constructor() ERC20("", "") {
+        _initialized = true;
+    }
+
+    /// @notice One-time setup of a clone, called by PairDeployer in the launch transaction.
+    function initialize(Config memory c, string calldata name_, string calldata symbol_) external {
+        require(!_initialized, "PairVault: initialized");
+        _initialized = true;
+        require(c.tokenA != address(0) && c.tokenB != address(0), "PairVault: zero token");
+        require(c.oracle != address(0), "PairVault: zero address");
+        _shareName = name_;
+        _shareSymbol = symbol_;
+        factory = c.factory == address(0) ? msg.sender : c.factory;
+        creator = c.creator;
+        tokenA = c.tokenA;
+        tokenB = c.tokenB;
+        weightABps = c.weightABps;
+        creatorFeeBps = c.creatorFeeBps;
+        oracle = OracleAdapter(c.oracle);
+        emergency = EmergencyRegistry(c.emergency);
+        weth = c.weth;
+        decimalsA = IERC20Metadata(c.tokenA).decimals();
+        decimalsB = IERC20Metadata(c.tokenB).decimals();
+    }
+
+    // ─── Views ──────────────────────────────────────────────
+
+    function weightBBps() external view returns (uint16) {
+        return uint16(10_000 - weightABps);
+    }
+
+    /// @notice The share token is the vault itself. Kept for callers that
+    ///         historically read a separate receipt-token address.
+    function receiptToken() external view returns (address) {
+        return address(this);
+    }
+
+    function name() public view override returns (string memory) {
+        return _shareName;
+    }
+
+    function symbol() public view override returns (string memory) {
+        return _shareSymbol;
+    }
+
+    function totalShares() public view returns (uint256) {
+        return totalSupply();
+    }
+
+    function reserves() public view returns (uint256 balA, uint256 balB) {
+        balA = IERC20(tokenA).balanceOf(address(this));
+        balB = IERC20(tokenB).balanceOf(address(this));
+    }
+
+    /// @notice USD value (8 decimals) of both reserves at the latest oracle prices.
+    function navUsd8() public view returns (uint256) {
+        (uint256 balA, uint256 balB) = reserves();
+        return _valueUsd8(tokenA, decimalsA, balA) + _valueUsd8(tokenB, decimalsB, balB);
+    }
+
+    /// @notice USD (8 decimals) per 1e18 shares. $1.00 before the first deposit.
+    function sharePrice() external view returns (uint256) {
+        uint256 ts = totalShares();
+        if (ts == 0) return 1e8;
+        return Math.mulDiv(navUsd8(), 1e18, ts);
+    }
+
+    /// @notice Token amounts needed to deposit roughly `valueUsd8` of value,
+    ///         and the gross shares that deposit mints (before creator fee).
+    function quoteDeposit(uint256 valueUsd8)
+        external
+        view
+        returns (uint256 amountA, uint256 amountB, uint256 shares)
+    {
+        uint256 ts = totalShares();
+        if (ts == 0) {
+            uint256 valueA = (valueUsd8 * weightABps) / 10_000;
+            amountA = _amountForValue(tokenA, decimalsA, valueA);
+            amountB = _amountForValue(tokenB, decimalsB, valueUsd8 - valueA);
+            shares = valueUsd8 * SHARE_SCALE;
+            return (amountA, amountB, shares);
+        }
+        uint256 nav = navUsd8();
+        require(nav > 0, "PairVault: no price");
+        shares = Math.mulDiv(valueUsd8, ts, nav);
+        (uint256 balA, uint256 balB) = reserves();
+        amountA = Math.mulDiv(shares, balA, ts, Math.Rounding.Ceil);
+        amountB = Math.mulDiv(shares, balB, ts, Math.Rounding.Ceil);
+    }
+
+    /// @notice Gross shares and exact token amounts a deposit of at most
+    ///         (`maxA`, `maxB`) would use right now.
+    function previewDeposit(uint256 maxA, uint256 maxB)
+        external
+        view
+        returns (uint256 shares, uint256 usedA, uint256 usedB)
+    {
+        uint256 ts = totalShares();
+        if (ts == 0) {
+            uint256 value = _valueUsd8(tokenA, decimalsA, maxA) + _valueUsd8(tokenB, decimalsB, maxB);
+            return (value * SHARE_SCALE, maxA, maxB);
+        }
+        return _proportional(ts, maxA, maxB);
+    }
+
+    function quoteRedeem(uint256 shares)
+        public
+        view
+        returns (uint256 amountA, uint256 amountB, uint256 valueUsd8)
+    {
+        uint256 ts = totalShares();
+        if (ts == 0 || shares == 0) return (0, 0, 0);
+        (uint256 balA, uint256 balB) = reserves();
+        amountA = Math.mulDiv(shares, balA, ts);
+        amountB = Math.mulDiv(shares, balB, ts);
+        valueUsd8 = _valueUsd8(tokenA, decimalsA, amountA) + _valueUsd8(tokenB, decimalsB, amountB);
+    }
+
+    // ─── Deposit ────────────────────────────────────────────
+
+    /// @notice Deposit up to `maxA` tokenA and `maxB` tokenB. Only the
+    ///         proportional amounts are pulled. If one leg is WETH you may send
+    ///         native ETH instead; unused ETH is refunded.
+    function deposit(uint256 maxA, uint256 maxB, uint256 minShares)
+        external
+        payable
+        nonReentrant
+        returns (uint256 shares)
+    {
+        return _deposit(msg.sender, maxA, maxB, minShares);
+    }
+
+    /// @notice Deposit on behalf of `recipient`; the caller pays.
+    function depositFor(address recipient, uint256 maxA, uint256 maxB, uint256 minShares)
+        external
+        payable
+        nonReentrant
+        returns (uint256 shares)
+    {
+        require(recipient != address(0), "PairVault: zero recipient");
+        return _deposit(recipient, maxA, maxB, minShares);
+    }
+
+    function _deposit(address recipient, uint256 maxA, uint256 maxB, uint256 minShares)
+        internal
+        returns (uint256 shares)
+    {
+        require(!emergency.depositsPaused(), "PairVault: deposits paused");
+        // Deposits: creator or fee-exempt recipients only. The pair is private to
+        // its creator; the public holds the curve token, whose buys reach the vault
+        // through a factory-approved fee-exempt recipient (CurveRouter). The launch
+        // seed the factory places is the third allowed path. Checked before any
+        // token is pulled so a stranger fails fast with a clear reason.
+        require(
+            recipient == creator || msg.sender == factory || _feeExempt(recipient),
+            "PairVault: creator only"
+        );
+        require(
+            !oracle.isMultiplierPending(tokenA) && !oracle.isMultiplierPending(tokenB),
+            "PairVault: multiplier pending"
+        );
+        if (msg.value > 0) {
+            require(weth != address(0) && (tokenA == weth || tokenB == weth), "PairVault: ETH not accepted");
+        }
+
+        uint256 ts = totalShares();
+        uint256 gross;
+        uint256 usedA;
+        uint256 usedB;
+        if (ts == 0) {
+            (gross, usedA, usedB) = _initial(maxA, maxB);
+        } else {
+            (gross, usedA, usedB) = _proportional(ts, maxA, maxB);
+            require(gross > 0, "PairVault: zero shares");
+        }
+
+        uint256 nativeSpent = _pull(tokenA, usedA) + _pull(tokenB, usedB);
+        if (msg.value > nativeSpent) {
+            (bool ok, ) = msg.sender.call{value: msg.value - nativeSpent}("");
+            require(ok, "PairVault: refund failed");
+        }
+
+        // Allowed depositors never pay a fee (checked at the top of _deposit).
+        shares = gross;
+        require(shares >= minShares, "PairVault: slippage");
+
+        _mint(recipient, shares);
+
+        emit Deposited(recipient, usedA, usedB, shares, 0, navUsd8());
+    }
+
+    /// @dev Asks the factory whether `recipient` is fee-exempt; false when the factory
+    ///      is an EOA or predates the feature (no revert, no assumptions).
+    function _feeExempt(address recipient) internal view returns (bool) {
+        (bool ok, bytes memory data) =
+            factory.staticcall(abi.encodeWithSignature("feeExemptRecipients(address)", recipient));
+        return ok && data.length == 32 && abi.decode(data, (bool));
+    }
+
+    /// @dev First deposit: value split must match the target weight at fresh prices.
+    function _initial(uint256 amountA, uint256 amountB)
+        internal
+        view
+        returns (uint256 gross, uint256 usedA, uint256 usedB)
+    {
+        require(amountA > 0 && amountB > 0, "PairVault: zero amount");
+        uint256 valueA = oracle.getTokenValueUsd(tokenA, amountA);
+        uint256 valueB = oracle.getTokenValueUsd(tokenB, amountB);
+        uint256 total = valueA + valueB;
+        require(total > 0, "PairVault: zero value");
+        uint256 actualWeightA = (valueA * 10_000) / total;
+        uint256 diff = actualWeightA > weightABps
+            ? actualWeightA - weightABps
+            : weightABps - actualWeightA;
+        require(diff <= WEIGHT_TOLERANCE_BPS, "PairVault: weight mismatch");
+        gross = total * SHARE_SCALE;
+        require(gross >= MIN_INITIAL_SHARES, "PairVault: seed too small");
+        return (gross, amountA, amountB);
+    }
+
+    function _proportional(uint256 ts, uint256 maxA, uint256 maxB)
+        internal
+        view
+        returns (uint256 gross, uint256 usedA, uint256 usedB)
+    {
+        (uint256 balA, uint256 balB) = reserves();
+        require(balA > 0 && balB > 0, "PairVault: empty reserves");
+        uint256 sharesA = Math.mulDiv(maxA, ts, balA);
+        uint256 sharesB = Math.mulDiv(maxB, ts, balB);
+        gross = sharesA < sharesB ? sharesA : sharesB;
+        usedA = Math.mulDiv(gross, balA, ts, Math.Rounding.Ceil);
+        usedB = Math.mulDiv(gross, balB, ts, Math.Rounding.Ceil);
+    }
+
+    /// @dev Pulls `amount` of `token` from the caller. Wraps native ETH for the
+    ///      WETH leg when ETH was sent. Returns the native wei consumed.
+    function _pull(address token, uint256 amount) internal returns (uint256 nativeSpent) {
+        if (amount == 0) return 0;
+        if (token == weth && msg.value > 0) {
+            require(msg.value >= amount, "PairVault: insufficient ETH");
+            IWETH(weth).deposit{value: amount}();
+            return amount;
+        }
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        return 0;
+    }
+
+    // ─── Redeem ─────────────────────────────────────────────
+
+    /// @notice Burn shares for a proportional slice of both reserves. Never
+    ///         paused and never depends on oracle freshness.
+    function redeem(uint256 shares, uint256 minAmountA, uint256 minAmountB)
+        external
+        nonReentrant
+        returns (uint256 amountA, uint256 amountB)
+    {
+        return _redeem(msg.sender, shares, minAmountA, minAmountB, msg.sender);
+    }
+
+    /// @notice Burn `owner`'s shares and send both tokens to `to`. Callable by
+    ///         the owner, or by a spender the owner approved for at least
+    ///         `shares` through the standard ERC-20 `approve` (e.g. PairRouter).
+    function redeemFrom(
+        address owner,
+        uint256 shares,
+        uint256 minAmountA,
+        uint256 minAmountB,
+        address to
+    ) external nonReentrant returns (uint256 amountA, uint256 amountB) {
+        require(to != address(0), "PairVault: zero recipient");
+        if (msg.sender != owner) _spendAllowance(owner, msg.sender, shares);
+        return _redeem(owner, shares, minAmountA, minAmountB, to);
+    }
+
+    function _redeem(address owner, uint256 shares, uint256 minAmountA, uint256 minAmountB, address to)
+        internal
+        returns (uint256 amountA, uint256 amountB)
+    {
+        require(shares > 0, "PairVault: zero shares");
+        uint256 valueUsd8;
+        (amountA, amountB, valueUsd8) = quoteRedeem(shares);
+        require(amountA >= minAmountA && amountB >= minAmountB, "PairVault: slippage");
+
+        _burn(owner, shares);
+        if (amountA > 0) IERC20(tokenA).safeTransfer(to, amountA);
+        if (amountB > 0) IERC20(tokenB).safeTransfer(to, amountB);
+
+        emit Redeemed(owner, shares, amountA, amountB, valueUsd8);
+    }
+
+    // ─── Pricing helpers ────────────────────────────────────
+
+    /// @dev Value at the latest price, ignoring staleness; 0 if the feed is unusable.
+    function _valueUsd8(address token, uint8 dec, uint256 amount) internal view returns (uint256) {
+        if (amount == 0) return 0;
+        try oracle.getPriceUnchecked(token) returns (uint256 price) {
+            return Math.mulDiv(amount, price, 10 ** dec);
+        } catch {
+            return 0;
+        }
+    }
+
+    function _amountForValue(address token, uint8 dec, uint256 valueUsd8) internal view returns (uint256) {
+        uint256 price = oracle.getPriceUnchecked(token);
+        return Math.mulDiv(valueUsd8, 10 ** dec, price, Math.Rounding.Ceil);
+    }
+}

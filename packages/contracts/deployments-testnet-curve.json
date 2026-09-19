@@ -1,0 +1,6 @@
+{
+  "curveRouter": "0x6f642Bfc6Ffb7C2968e0aB3B226383B662839278",
+  "composeCurve": "0x93022717CF9E550183924c7ae409ccbcAE1132CB",
+  "pairFactory": "0x620c97dF1dD7db6261Ac89c9f892aE7999C950B1",
+  "pairRouter": "0x09EEeb1ec66f06eBd1Bf1A0bD3ca48889D6693c4"
+}
